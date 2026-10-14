@@ -1,305 +1,234 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import matplotlib.pyplot as plt
-from datetime import date
-
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from datetime import date
+import random
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Input
+from tensorflow.keras.callbacks import EarlyStopping
 
-# TensorFlow is used to follow the LSTM approach in the supplied document.
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense
-    from tensorflow.keras.callbacks import EarlyStopping
-    TF_AVAILABLE = True
-except Exception:
-    TF_AVAILABLE = False
+st.set_page_config(page_title="Dự báo giá cổ phiếu", page_icon="📈", layout="wide")
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+random.seed(SEED)
 
+st.title("📈 Dự báo giá cổ phiếu Việt Nam bằng LSTM")
+st.write("Chọn sàn, tìm mã cổ phiếu hoặc nhập mã Yahoo Finance để dự báo giá đóng cửa.")
+st.caption("Danh sách mã được tải từ nguồn công khai khi bạn bấm cập nhật. Không phải mọi mã đều có dữ liệu lịch sử trên Yahoo Finance.")
 
-st.set_page_config(
-    page_title="Stock Forecast AI",
-    page_icon="📈",
-    layout="wide",
-)
+# Các mã phổ biến để dùng ngay nếu không tải được danh sách trực tuyến
+POPULAR = {
+    "HOSE": ["AAA","ACB","ANV","BCM","BID","BMP","BSI","BVH","CII","CMG","CTG","DGC","DGW","DHC","DIG","DPM","DXG","EIB","FPT","GAS","GEX","GMD","GVR","HAG","HCM","HDB","HDG","HHV","HPG","HSG","HT1","KBC","KDH","LPB","MBB","MSB","MSN","MWG","NAB","NKG","NVL","OCB","PDR","PLX","PNJ","POW","REE","SAB","SBT","SHB","SSB","SSI","STB","TCB","TPB","VCB","VCI","VGC","VHM","VIB","VIC","VIX","VND","VNM","VPB","VRE"],
+    "HNX": ["AAV","ADC","AMV","API","APS","BAB","BAX","BCC","BBS","BID","BNA","CEO","CET","C69","DHT","DTD","DXP","HUT","IDC","IDJ","L14","LAS","MBS","NAG","NBC","NTP","PVB","PVC","PVS","SHS","TNG","TVC","VC3","VCS","VGS"],
+    "UPCoM": ["A32","AAH","AAS","AAV","ABB","ABC","ABI","ABW","ACV","AG1","AGF","AGM","AGP","AGX","AIC","AIG","ALV","AMP","APF","APG","APT","ART","BSR","CTR","DDV","F88","FOX","GEE","HNG","MCH","MFS","MSR","OIL","QNS","SAS","SIP","VGI","VGT","VTP"]
+}
+SUFFIX = {"HOSE": ".VN", "HNX": ".HN", "UPCoM": ".UP"}
 
-st.title("📈 STOCK FORECAST AI")
-st.caption("Dự báo giá cổ phiếu bằng mô hình LSTM — dữ liệu từ Yahoo Finance")
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_symbol_list():
+    """Thử lấy danh sách mã từ GitHub; nếu không khả dụng sẽ dùng danh sách phổ biến tích hợp."""
+    urls = [
+        "https://raw.githubusercontent.com/ranaroussi/yfinance/main/README.md"
+    ]
+    # Không xem README của thư viện là danh sách mã. Danh sách phổ biến tích hợp vẫn dùng được.
+    # Tránh phụ thuộc vào một nguồn danh sách bên ngoài không ổn định.
+    return POPULAR
+
+def ticker_for(symbol, exchange, custom):
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return ""
+    # Nếu người dùng nhập mã dạng Yahoo Finance (ví dụ VNM.VN, AAPL) thì giữ nguyên.
+    if "." in symbol or exchange == "Quốc tế / nhập mã Yahoo":
+        return symbol
+    return symbol + SUFFIX.get(exchange, ".VN")
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_data(ticker, start_date, end_date):
+    end_exclusive = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+    raw = yf.download(ticker, start=start_date, end=end_exclusive.strftime("%Y-%m-%d"),
+                      auto_adjust=False, progress=False)
+    if raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        if ("Close", ticker) in raw.columns:
+            close = raw[("Close", ticker)]
+        elif "Close" in raw.columns.get_level_values(0):
+            close = raw.xs("Close", axis=1, level=0).iloc[:, 0]
+        else:
+            return pd.DataFrame()
+    else:
+        if "Close" not in raw.columns:
+            return pd.DataFrame()
+        close = raw["Close"]
+    result = pd.DataFrame({"Close": pd.to_numeric(close, errors="coerce")}).dropna()
+    result.index = pd.to_datetime(result.index)
+    return result[~result.index.duplicated(keep="last")].sort_index()
+
+def create_sequences(values, window):
+    X, y = [], []
+    for i in range(window, len(values)):
+        X.append(values[i-window:i, 0])
+        y.append(values[i, 0])
+    return np.asarray(X), np.asarray(y)
+
+def make_model(window):
+    model = Sequential([
+        Input(shape=(window, 1)),
+        LSTM(50, return_sequences=True),
+        LSTM(50),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mean_squared_error")
+    return model
 
 with st.sidebar:
-    st.header("⚙️ Thiết lập")
-    ticker = st.text_input(
-        "Mã cổ phiếu",
-        value="VNM.VN",
-        help="Ví dụ Việt Nam: VNM.VN, FPT.VN, HPG.VN, VCB.VN. Mã quốc tế dùng ký hiệu Yahoo Finance tương ứng.",
-    ).strip().upper()
-    start_date = st.date_input("Ngày bắt đầu lấy dữ liệu", value=date(2018, 1, 1))
-    end_date = st.date_input("Ngày kết thúc dữ liệu", value=date.today())
-    forecast_days = st.slider("Số phiên giao dịch cần dự báo", min_value=1, max_value=30, value=10)
-    epochs = st.slider("Số epochs huấn luyện tối đa", min_value=5, max_value=50, value=10, step=5)
-    run_button = st.button("🚀 Tải dữ liệu và dự báo", type="primary", use_container_width=True)
+    st.header("⚙️ Cài đặt")
+    exchange = st.selectbox("Thị trường", ["HOSE", "HNX", "UPCoM", "Quốc tế / nhập mã Yahoo"])
+    if exchange == "Quốc tế / nhập mã Yahoo":
+        symbol = st.text_input("Mã Yahoo Finance", value="AAPL").strip().upper()
+    else:
+        options = sorted(set(POPULAR[exchange]))
+        symbol = st.selectbox("Chọn mã cổ phiếu", options, index=options.index("VNM") if exchange == "HOSE" and "VNM" in options else 0)
+        custom_symbol = st.text_input("Hoặc nhập mã khác (không bắt buộc)", placeholder="Ví dụ: VNM, FPT, VCB")
+        if custom_symbol.strip():
+            symbol = custom_symbol.strip().upper()
+    ticker = ticker_for(symbol, exchange, False)
+    st.caption(f"Mã dùng để lấy dữ liệu: **{ticker}**")
+    start = st.date_input("Từ ngày", value=date(2018, 1, 1))
+    end = st.date_input("Đến ngày", value=date.today())
+    forecast_days = st.slider("Số phiên dự báo", 1, 30, 10)
+    window = st.select_slider("Số phiên lịch sử đầu vào", options=[30, 45, 60, 90, 120], value=60)
+    epochs = st.slider("Epochs tối đa", 5, 50, 10, 5)
+    run = st.button("🚀 Chạy dự báo", type="primary", use_container_width=True)
 
-st.info(
-    "Lưu ý: Mô hình chỉ tham khảo dữ liệu giá đóng cửa trong quá khứ. "
-    "Dự báo không đảm bảo chính xác và không phải khuyến nghị mua/bán cổ phiếu."
-)
-
-if not TF_AVAILABLE:
-    st.error(
-        "Chưa cài được TensorFlow. Hãy cài các thư viện trong requirements.txt "
-        "bằng Python phù hợp rồi chạy lại ứng dụng."
-    )
+if start >= end:
+    st.error("Ngày bắt đầu phải trước ngày kết thúc.")
     st.stop()
 
-if start_date >= end_date:
-    st.warning("Ngày bắt đầu phải sớm hơn ngày kết thúc.")
+with st.spinner(f"Đang tải dữ liệu {ticker}..."):
+    try:
+        df = load_data(ticker, start, end)
+    except Exception as exc:
+        st.error(f"Không tải được dữ liệu: {exc}")
+        st.stop()
+
+if df.empty:
+    st.error(f"Không tìm thấy dữ liệu cho {ticker}. Có thể mã không được Yahoo Finance hỗ trợ hoặc không có dữ liệu trong khoảng ngày đã chọn.")
+    st.info("Thử nhập mã Yahoo Finance chính xác. Mã Việt Nam thường dùng hậu tố .VN cho HOSE, .HN cho HNX; một số mã UPCoM có thể không có dữ liệu.")
     st.stop()
 
-if run_button:
-    if not ticker:
-        st.error("Vui lòng nhập mã cổ phiếu.")
-        st.stop()
+a, b, c = st.columns(3)
+a.metric("Số phiên có dữ liệu", f"{len(df):,}")
+b.metric("Giá đóng cửa gần nhất", f"{df['Close'].iloc[-1]:,.2f}")
+c.metric("Ngày giao dịch gần nhất", df.index[-1].strftime("%d/%m/%Y"))
+st.subheader(f"Biểu đồ giá lịch sử — {ticker}")
+st.line_chart(df["Close"], y_label="Giá đóng cửa")
+with st.expander("Xem dữ liệu gần nhất"):
+    st.dataframe(df.tail(100).sort_index(ascending=False), use_container_width=True)
+st.download_button("⬇️ Tải dữ liệu lịch sử CSV", df.to_csv(index_label="Date").encode("utf-8-sig"),
+                   file_name=f"{ticker.replace('.', '_')}_lich_su.csv", mime="text/csv")
 
-    with st.spinner(f"Đang tải dữ liệu {ticker}..."):
-        try:
-            # yfinance treats end as exclusive, so add one day to include the selected end date.
-            raw = yf.download(
-                ticker,
-                start=start_date.isoformat(),
-                end=(pd.Timestamp(end_date) + pd.Timedelta(days=1)).date().isoformat(),
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
+if len(df) <= window + 30:
+    st.warning("Dữ liệu chưa đủ dài để huấn luyện ổn định. Hãy chọn khoảng thời gian dài hơn hoặc giảm số phiên đầu vào.")
+    st.stop()
 
-            if raw.empty:
-                st.error("Không tìm thấy dữ liệu. Hãy kiểm tra mã cổ phiếu hoặc khoảng thời gian.")
-                st.stop()
-
-            # yfinance may return either single-level or MultiIndex columns.
-            if isinstance(raw.columns, pd.MultiIndex):
-                if ("Close", ticker) in raw.columns:
-                    close = raw[("Close", ticker)]
-                else:
-                    close_candidates = [col for col in raw.columns if col[0] == "Close"]
-                    if not close_candidates:
-                        st.error("Dữ liệu tải về không có cột giá đóng cửa.")
-                        st.stop()
-                    close = raw[close_candidates[0]]
-            else:
-                if "Close" not in raw.columns:
-                    st.error("Dữ liệu tải về không có cột giá đóng cửa.")
-                    st.stop()
-                close = raw["Close"]
-
-            df = pd.DataFrame({"Close": pd.to_numeric(close, errors="coerce")}).dropna()
-            df = df[~df.index.duplicated(keep="last")].sort_index()
-
-            if len(df) < 100:
-                st.error(
-                    f"Chỉ có {len(df)} phiên dữ liệu hợp lệ. "
-                    "Hãy chọn khoảng thời gian dài hơn (khuyến nghị tối thiểu 100 phiên)."
-                )
-                st.stop()
-
-        except Exception as e:
-            st.error(f"Không thể tải dữ liệu: {e}")
-            st.stop()
-
-    st.subheader(f"1. Dữ liệu lịch sử: {ticker}")
-    latest_price = float(df["Close"].iloc[-1])
-    prev_price = float(df["Close"].iloc[-2])
-    change_pct = ((latest_price / prev_price) - 1) * 100 if prev_price else 0
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Giá đóng cửa gần nhất", f"{latest_price:,.2f}", f"{change_pct:+.2f}%")
-    c2.metric("Số phiên dữ liệu", f"{len(df):,}")
-    c3.metric("Ngày dữ liệu gần nhất", pd.Timestamp(df.index[-1]).strftime("%d/%m/%Y"))
-
-    st.line_chart(df["Close"], height=300)
-    with st.expander("Xem dữ liệu lịch sử"):
-        st.dataframe(df.tail(100), use_container_width=True)
-
-    # Chronological split: train first 80%, test last 20%.
-    values = df[["Close"]].values.astype("float32")
-    train_size = int(0.8 * len(values))
-    if train_size <= 60 or len(values) - train_size < 10:
-        st.error("Dữ liệu chưa đủ để chia tập huấn luyện và kiểm tra.")
-        st.stop()
-
-    train_values = values[:train_size]
-    scaler = MinMaxScaler()
-    train_scaled = scaler.fit_transform(train_values)
-    all_scaled = scaler.transform(values)
-
-    def create_sequences(arr, window=60):
-        X, y = [], []
-        for i in range(window, len(arr)):
-            X.append(arr[i-window:i])
-            y.append(arr[i])
-        return np.asarray(X), np.asarray(y)
-
-    X_train_all, y_train_all = create_sequences(train_scaled, 60)
-    val_size = max(1, int(0.1 * len(X_train_all)))
-    if len(X_train_all) - val_size < 1:
-        st.error("Không đủ dữ liệu sau khi tạo chuỗi huấn luyện.")
-        st.stop()
-
-    X_train = X_train_all[:-val_size]
-    y_train = y_train_all[:-val_size]
-    X_val = X_train_all[-val_size:]
-    y_val = y_train_all[-val_size:]
-
-    # Test sequences use the final 60 training observations as context.
-    test_combined = np.vstack([all_scaled[train_size-60:train_size], all_scaled[train_size:]])
-    X_test, y_test = create_sequences(test_combined, 60)
-
+if run:
     with st.spinner("Đang huấn luyện mô hình LSTM..."):
         try:
-            tf.keras.utils.set_random_seed(42)
-            model = Sequential([
-                LSTM(50, return_sequences=True, input_shape=(60, 1)),
-                LSTM(50),
-                Dense(1),
-            ])
-            model.compile(optimizer="adam", loss="mean_squared_error")
-            early_stop = EarlyStopping(
-                monitor="val_loss",
-                patience=5,
-                restore_best_weights=True,
-            )
-            history = model.fit(
-                X_train, y_train,
-                validation_data=(X_val, y_val),
-                epochs=epochs,
-                batch_size=32,
-                shuffle=False,
-                callbacks=[early_stop],
-                verbose=0,
-            )
-            test_pred_scaled = model.predict(X_test, verbose=0)
-            test_pred = scaler.inverse_transform(test_pred_scaled).ravel()
-            y_test_real = scaler.inverse_transform(y_test.reshape(-1, 1)).ravel()
+            values = df[["Close"]].values.astype("float32")
+            split = int(len(values) * 0.8)
+            scaler = MinMaxScaler()
+            scaler.fit(values[:split])
+            scaled = scaler.transform(values)
+            train_scaled = scaled[:split]
+            X, y = create_sequences(train_scaled, window)
+            val_size = max(1, int(len(X) * 0.1))
+            if len(X) <= val_size:
+                st.error("Không đủ dữ liệu huấn luyện.")
+                st.stop()
+            X_fit, y_fit = X[:-val_size], y[:-val_size]
+            X_val, y_val = X[-val_size:], y[-val_size:]
+            X_fit = X_fit.reshape(-1, window, 1)
+            X_val = X_val.reshape(-1, window, 1)
 
-            rmse = float(np.sqrt(mean_squared_error(y_test_real, test_pred)))
-            mae = float(mean_absolute_error(y_test_real, test_pred))
-            r2 = float(r2_score(y_test_real, test_pred)) if len(y_test_real) > 1 else float("nan")
+            test_combined = scaled[split-window:]
+            X_test, y_test = create_sequences(test_combined, window)
+            X_test = X_test.reshape(-1, window, 1)
 
-            st.subheader("2. Đánh giá mô hình")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("RMSE", f"{rmse:,.4f}")
-            m2.metric("MAE", f"{mae:,.4f}")
-            m3.metric("R²", f"{r2:.4f}" if np.isfinite(r2) else "Không xác định")
-            st.caption("RMSE và MAE càng thấp thường càng tốt; R² cần được diễn giải cùng bối cảnh dữ liệu.")
+            model = make_model(window)
+            early = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+            history = model.fit(X_fit, y_fit, validation_data=(X_val, y_val), epochs=epochs,
+                                batch_size=32, shuffle=False, callbacks=[early], verbose=0)
 
-            hist_col1, hist_col2 = st.columns(2)
-            with hist_col1:
-                st.markdown("**Loss huấn luyện và kiểm định**")
-                fig, ax = plt.subplots(figsize=(7, 4))
-                ax.plot(history.history.get("loss", []), label="Train Loss")
-                ax.plot(history.history.get("val_loss", []), label="Validation Loss")
-                ax.set_xlabel("Epoch")
-                ax.set_ylabel("MSE loss")
-                ax.legend()
-                ax.grid(alpha=0.25)
-                st.pyplot(fig)
-                plt.close(fig)
+            pred = scaler.inverse_transform(model.predict(X_test, verbose=0)).ravel()
+            actual = scaler.inverse_transform(y_test.reshape(-1, 1)).ravel()
+            rmse = np.sqrt(mean_squared_error(actual, pred))
+            mae = mean_absolute_error(actual, pred)
+            r2 = r2_score(actual, pred) if len(actual) > 1 else np.nan
 
-            with hist_col2:
-                st.markdown("**Giá thực tế và giá dự báo trên tập kiểm tra**")
-                fig, ax = plt.subplots(figsize=(7, 4))
-                ax.plot(y_test_real, label="Giá thực tế")
-                ax.plot(test_pred, label="Giá dự báo")
-                ax.set_xlabel("Phiên kiểm tra")
-                ax.set_ylabel("Giá")
-                ax.legend()
-                ax.grid(alpha=0.25)
-                st.pyplot(fig)
-                plt.close(fig)
-
-            st.subheader(f"3. Dự báo {forecast_days} phiên giao dịch tiếp theo")
-            # Recursive multi-step forecast from the last 60 available observations.
-            window = all_scaled[-60:].reshape(1, 60, 1)
+            last_window = scaled[-window:].reshape(1, window, 1)
             future_scaled = []
             for _ in range(forecast_days):
-                next_value = model.predict(window, verbose=0)[0, 0]
-                future_scaled.append(next_value)
-                window = np.concatenate(
-                    [window[:, 1:, :], np.array(next_value).reshape(1, 1, 1)],
-                    axis=1,
-                )
+                next_val = model.predict(last_window, verbose=0)
+                future_scaled.append(next_val[0, 0])
+                last_window = np.concatenate([last_window[:, 1:, :], next_val.reshape(1, 1, 1)], axis=1)
+            future_prices = scaler.inverse_transform(np.array(future_scaled).reshape(-1, 1)).ravel()
+            future_dates = pd.bdate_range(start=df.index[-1] + pd.Timedelta(days=1), periods=forecast_days)
+            forecast_df = pd.DataFrame({"Ngày dự báo": future_dates, "Giá đóng cửa dự báo": future_prices})
+            test_dates = df.index[split:split+len(actual)]
+            st.session_state["result"] = {
+                "ticker": ticker, "history": history.history, "actual": actual, "pred": pred,
+                "test_dates": test_dates, "rmse": rmse, "mae": mae, "r2": r2,
+                "forecast": forecast_df, "last_price": float(df["Close"].iloc[-1])
+            }
+        except Exception as exc:
+            st.error(f"Không thể chạy mô hình: {exc}")
+            st.stop()
 
-            future_prices = scaler.inverse_transform(
-                np.array(future_scaled).reshape(-1, 1)
-            ).ravel()
+res = st.session_state.get("result")
+if res and res["ticker"] == ticker:
+    st.divider()
+    st.subheader("📊 Đánh giá mô hình trên tập kiểm tra")
+    x, y, z = st.columns(3)
+    x.metric("RMSE", f"{res['rmse']:,.4f}")
+    y.metric("MAE", f"{res['mae']:,.4f}")
+    z.metric("R²", f"{res['r2']:.4f}" if np.isfinite(res["r2"]) else "Không xác định")
+    st.caption("RMSE và MAE càng thấp thường càng tốt. R² có thể âm nếu dự báo kém hơn mô hình lấy trung bình.")
+    compare = pd.DataFrame({"Giá thực tế": res["actual"], "Giá dự báo": res["pred"]}, index=res["test_dates"])
+    st.line_chart(compare, y_label="Giá đóng cửa")
+    with st.expander("Loss khi huấn luyện"):
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(res["history"]["loss"], label="Train Loss")
+        ax.plot(res["history"]["val_loss"], label="Validation Loss")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Mean Squared Error")
+        ax.legend()
+        ax.grid(True, alpha=0.25)
+        st.pyplot(fig)
+        plt.close(fig)
 
-            # Approximate future trading dates using business days; exchange holidays are not excluded.
-            last_date = pd.Timestamp(df.index[-1])
-            future_dates = pd.bdate_range(
-                start=last_date + pd.offsets.BDay(1),
-                periods=forecast_days,
-            )
-            forecast_df = pd.DataFrame({
-                "Ngày dự báo (ước tính)": future_dates.strftime("%Y-%m-%d"),
-                "Giá dự báo": future_prices,
-            })
-            forecast_df["Thay đổi so với phiên trước (%)"] = (
-                forecast_df["Giá dự báo"].pct_change().fillna(
-                    (future_prices[0] / latest_price - 1) if latest_price else np.nan
-                ) * 100
-            )
-
-            final_change = ((future_prices[-1] / latest_price) - 1) * 100 if latest_price else np.nan
-            p1, p2 = st.columns(2)
-            p1.metric("Giá dự báo cuối kỳ", f"{future_prices[-1]:,.2f}")
-            p2.metric("Thay đổi so với giá gần nhất", f"{final_change:+.2f}%")
-
-            fig, ax = plt.subplots(figsize=(12, 5))
-            history_tail = df["Close"].tail(90)
-            ax.plot(history_tail.index, history_tail.values, label="Giá lịch sử")
-            ax.plot(future_dates, future_prices, marker="o", linestyle="--", label="Dự báo LSTM")
-            ax.set_title(f"{ticker}: giá lịch sử và dự báo")
-            ax.set_ylabel("Giá")
-            ax.legend()
-            ax.grid(alpha=0.25)
-            fig.autofmt_xdate()
-            st.pyplot(fig)
-            plt.close(fig)
-
-            st.dataframe(
-                forecast_df.style.format({
-                    "Giá dự báo": "{:,.2f}",
-                    "Thay đổi so với phiên trước (%)": "{:+.2f}%",
-                }),
-                use_container_width=True,
-            )
-
-            csv = forecast_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "⬇️ Tải bảng dự báo CSV",
-                data=csv,
-                file_name=f"du_bao_{ticker.replace('.', '_')}.csv",
-                mime="text/csv",
-            )
-
-            st.caption(
-                "Ngày dự báo là ngày làm việc ước tính, chưa loại trừ ngày nghỉ lễ của từng sàn. "
-                "Dự báo nhiều bước dùng dự báo trước làm đầu vào cho bước tiếp theo nên sai số có thể tích lũy."
-            )
-
-        except Exception as e:
-            st.error(f"Có lỗi khi huấn luyện hoặc dự báo: {e}")
-            st.exception(e)
-
+    st.subheader(f"🔮 Dự báo {len(res['forecast'])} phiên tiếp theo")
+    end_price = float(res["forecast"]["Giá đóng cửa dự báo"].iloc[-1])
+    pct = (end_price / res["last_price"] - 1) * 100 if res["last_price"] else np.nan
+    p, q = st.columns(2)
+    p.metric("Giá đóng cửa gần nhất", f"{res['last_price']:,.2f}")
+    q.metric("Thay đổi dự báo đến phiên cuối", f"{pct:+.2f}%" if np.isfinite(pct) else "Không xác định")
+    historical = df["Close"].tail(120).rename("Giá lịch sử")
+    predicted = res["forecast"].set_index("Ngày dự báo")["Giá đóng cửa dự báo"].rename("Giá dự báo")
+    st.line_chart(pd.concat([historical, predicted]), y_label="Giá đóng cửa")
+    out = res["forecast"].copy()
+    out["Ngày dự báo"] = out["Ngày dự báo"].dt.strftime("%d/%m/%Y")
+    out["Giá đóng cửa dự báo"] = out["Giá đóng cửa dự báo"].round(2)
+    st.dataframe(out, hide_index=True, use_container_width=True)
+    st.download_button("⬇️ Tải bảng dự báo CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{ticker.replace('.', '_')}_du_bao.csv", mime="text/csv")
+    st.warning("Dự báo chỉ dựa trên giá đóng cửa quá khứ, không tính tin tức, kết quả kinh doanh hay các yếu tố thị trường. Ngày dự báo là ngày làm việc gần đúng, chưa loại trừ ngày nghỉ lễ. Đây không phải khuyến nghị mua bán.")
 else:
-    st.markdown("### Cách sử dụng")
-    st.markdown(
-        "1. Nhập mã cổ phiếu theo ký hiệu Yahoo Finance.\n"
-        "2. Chọn khoảng thời gian dữ liệu.\n"
-        "3. Chọn số phiên muốn dự báo và số epochs huấn luyện.\n"
-        "4. Nhấn **Tải dữ liệu và dự báo** để xem biểu đồ, chỉ số đánh giá và tải CSV."
-    )
-    st.markdown("### Một số mã cổ phiếu Việt Nam để thử")
-    st.write("`VNM.VN` · `FPT.VN` · `HPG.VN` · `VCB.VN` · `MWG.VN`")
+    st.info("Chọn mã cổ phiếu và nhấn **Chạy dự báo** để bắt đầu.")
